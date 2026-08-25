@@ -863,17 +863,28 @@ entry is headed by its payload `title`, falling back to the `plugin_id`, so
 stacked panes stay attributable without the web's dock tabs. It renders text and
 tone only; `icon`, `tooltip`, `href`, and a pane's `default_location` are dropped
 (a single toggleable overlay has no docks to choose between), and `card`,
-`row-badge`, `sort-key`, and `filter-facet` have no structured-view surface.
+`sort-key`, and `filter-facet` have no structured-view surface.
 
 The **remote-home picker** (the daemon-connected session list, reached with
-`AOE_DAEMON_URL`) renders each session's `row-column` text in its own
-tone-colored column between the status and the project path (#2948). The snapshot
+`AOE_DAEMON_URL`) renders each session's `row-badge` chips (#2947) and
+`row-column` text (#2948), tone-colored, between the status and the project
+path. The snapshot
 is fetched with the session list rather than on its own cadence, so both refresh
-together on open and on `r`; this view has no ticker. The column's width is the
-widest cell across the listed sessions, capped at 24 columns, and every row pads
-to it, so a session with no entry leaves an aligned blank and no plugin entries
-at all reserve no width. A failed snapshot fetch clears the cells and leaves the
+together on open and on `r`; this view has no ticker. Each group's width is the
+widest it reaches across the listed sessions, and every row pads to it, so a
+session with no entry leaves an aligned blank and no plugin entries at all
+reserve no width. A failed snapshot fetch clears the cells and leaves the
 session list intact.
+
+Both groups share one 24-column region, of which the badges may take 10; the
+`row-column` text gets what they leave, and the whole 24 when no session carries
+a badge. The cap is shared rather than one per slot because the row already
+spends 41 columns on its highlight symbol, title, and status, so two independent
+24-column groups would push the project path off an 80-column terminal. A badge
+that carries only an `icon` renders nothing, since a lucide name has no terminal
+glyph and a generic stand-in would keep the badge's presence while dropping which
+state it meant; `items: []` clears the row as it does on the web. Opening a
+badge's `href` is a follow-up (#2528).
 
 The standalone home screen reads local session
 storage and has no
