@@ -130,6 +130,40 @@ lock over the POST round trip, not as a term in any dispatch decision. And the
 wake PATCH for an archived or snoozed session (#1581) stays, because it is a
 session-lifecycle action the user takes before the prompt exists.
 
+## Cancel ordering across the dispatch window
+
+Dispatch is not instantaneous, and the turn is advertised as active before the
+prompt reaches the agent: `SessionService::send_turn` publishes the user prompt
+and only then forwards it, and `acp_prompt` answers 202 before doing its
+pre-dispatch work at all. A connected UI therefore shows Stop, and can have a
+`POST /acp/cancel` accepted, while the prompt is still in flight internally.
+
+If that cancel reaches the agent first it is destroyed rather than queued: an
+agent clears its per-session cancel state when a prompt starts a turn, so the
+turn then runs uncancellable and the composer sits wedged. Measured in CI with
+the two POSTs 78ms apart.
+
+Two rules keep the ordering honest, and both are load-bearing:
+
+1. **Every producer reserves the window.** `Supervisor::begin_prompt_dispatch`
+   returns an RAII guard; the outermost holder re-sends a latched cancel once
+   the prompt is away. The reservation is re-entrant, so `acp_prompt`'s guard
+   (covering the HTTP pre-dispatch work) nests with `send_turn`'s (covering
+   publish-then-forward) instead of evicting it. A producer that enters through
+   `send_turn` directly, a plugin turn, a pending initial turn, or a queue
+   drain, is covered by the inner reservation alone.
+2. **`acp_cancel` always forwards, and the latch is only ever an addition.**
+   Deferring a cancel into the latch instead loses it whenever the reservation
+   holder exits without dispatching. The queued path is exactly such an exit,
+   and three of the four `QueueReason` values mean a turn is already running, so
+   deferring drops the Stop for the turn the user was actually looking at. The
+   cost of always forwarding is a duplicate `session/cancel` inside the race
+   window, which the in-flight branch resends harmlessly.
+
+Rule 2 is the one to be careful with when adding an exit to `acp_prompt`:
+`PromptDispatchGuard::drop` discards the latch, which is safe only because the
+cancel already went out at `acp_cancel` time.
+
 ## Alternatives considered
 
 - **Keep the decision client-side but share it.** No shared runtime exists

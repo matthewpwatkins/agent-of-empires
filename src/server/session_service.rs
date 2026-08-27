@@ -478,6 +478,15 @@ impl SessionService {
         prompt_id: Option<String>,
     ) -> Result<(), SendTurnError> {
         use crate::server::acp_reconciler::ResumeTrigger;
+        // Reserve the dispatch window for EVERY producer, not just the HTTP
+        // composer. `publish_user_prompt_with_attachments` below marks the turn
+        // active before `send_prompt` forwards it, so any connected UI can show
+        // Stop and enqueue a cancel in that gap; without a reservation here,
+        // plugin turns, pending initial turns and queue drains would hit the
+        // same reordering the composer path already guards. Re-entrant, so the
+        // composer's outer reservation is shared rather than replaced, and only
+        // the outermost holder answers `take_pending_cancel`.
+        let dispatch_guard = self.acp_supervisor.begin_prompt_dispatch(id);
         // Ownership gate, before ANY side effect (no wake, resume, publish,
         // or forward for a denied caller): a plugin may deliver turns only
         // to sessions it created. Ownership is immutable after creation, so
@@ -580,7 +589,27 @@ impl SessionService {
             }
         };
         match outcome {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Prompt is away. If a Stop landed while it was in dispatch and
+                // no outer holder will handle it (a non-composer producer), the
+                // agent already dropped that cancel on turn start; re-send it.
+                if dispatch_guard.take_pending_cancel() {
+                    tracing::info!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        "re-sending a cancel that arrived while the prompt was in dispatch"
+                    );
+                    if let Err(e) = self.acp_supervisor.cancel_prompt(id).await {
+                        tracing::warn!(
+                            target: "acp.supervisor",
+                            session = %id,
+                            error = %e,
+                            "re-sent cancel after prompt dispatch failed"
+                        );
+                    }
+                }
+                Ok(())
+            }
             // Intentional override of the canonical UnknownSession 404: the
             // readiness barrier above passed, so the worker was alive a
             // moment ago and died in the gap. Retryable rather than a 404,

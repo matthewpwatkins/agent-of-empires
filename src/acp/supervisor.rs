@@ -353,37 +353,58 @@ pub(crate) enum ResumeReservationOutcome {
     AlreadyPresent,
 }
 
+/// One session's prompt-dispatch reservation.
+///
+/// `refs` makes the reservation re-entrant. The HTTP composer handler takes one
+/// to cover its pre-dispatch work, and `SessionService::send_turn` takes another
+/// inside it to cover publish-then-forward; a producer that goes straight to
+/// `send_turn` (plugin turns, pending initial turns, queue drains) takes only
+/// the inner one. Nesting shares the slot rather than evicting it, so a cancel
+/// latched by either level survives until the outermost holder releases.
+struct DispatchSlot {
+    generation: u64,
+    refs: u32,
+    cancel_requested: bool,
+}
+
 /// RAII reservation for a prompt that has been accepted but not yet handed to
-/// the agent. Held across the whole `acp_prompt` handler so the reservation
-/// cannot leak through any of its early returns.
+/// the agent. Held across the whole handler so the reservation cannot leak
+/// through any of its early returns.
 pub struct PromptDispatchGuard {
-    slots: Arc<std::sync::Mutex<HashMap<String, (u64, bool)>>>,
+    slots: Arc<std::sync::Mutex<HashMap<String, DispatchSlot>>>,
     session_id: String,
     generation: u64,
     settled: bool,
 }
 
 impl PromptDispatchGuard {
-    /// Release the reservation and report whether a cancel arrived while the
-    /// prompt was in dispatch. Call this once the prompt is away: a `true`
-    /// means the caller owes the agent a `session/cancel` now.
+    /// Release this level of the reservation and report whether the agent is
+    /// owed a re-sent `session/cancel`.
+    ///
+    /// Only the outermost holder can answer `true`: an inner release leaves the
+    /// slot standing so the outer one still sees the latch. Call this once the
+    /// prompt is away.
     pub fn take_pending_cancel(mut self) -> bool {
         self.settled = true;
-        self.remove_if_current().unwrap_or(false)
+        self.release().unwrap_or(false)
     }
 
-    /// Remove this guard's own reservation, returning its `cancel_requested`
-    /// flag. A generation mismatch means a later prompt replaced the slot, so
-    /// this guard must leave it alone.
-    fn remove_if_current(&self) -> Option<bool> {
-        let mut slots = self.slots.lock().expect("prompt dispatch mutex");
-        match slots.get(&self.session_id) {
-            Some(&(generation, cancel_requested)) if generation == self.generation => {
-                slots.remove(&self.session_id);
-                Some(cancel_requested)
-            }
-            _ => None,
+    /// Drop one reference. Returns `Some(cancel_requested)` when that was the
+    /// last one and the slot is now gone, `None` while an outer holder remains
+    /// or when a later prompt has replaced the slot.
+    fn release(&self) -> Option<bool> {
+        let mut slots = lock_recover(&self.slots);
+        let slot = slots.get_mut(&self.session_id)?;
+        if slot.generation != self.generation {
+            return None;
         }
+        slot.refs = slot.refs.saturating_sub(1);
+        if slot.refs > 0 {
+            return None;
+        }
+        let cancel_requested = slot.cancel_requested;
+        slots.remove(&self.session_id);
+        Some(cancel_requested)
     }
 }
 
@@ -395,7 +416,7 @@ impl Drop for PromptDispatchGuard {
             // because `acp_cancel` already forwarded that cancel; a turn may
             // well be running (the queued path is reached precisely when one
             // is), and it must not be left running.
-            let _ = self.remove_if_current();
+            let _ = self.release();
         }
     }
 }
@@ -455,7 +476,7 @@ pub struct Supervisor<S: BroadcastSink> {
     ///
     /// The generation makes removal precise: a stale guard cannot clear a
     /// reservation a later prompt installed.
-    prompt_dispatches: Arc<std::sync::Mutex<HashMap<String, (u64, bool)>>>,
+    prompt_dispatches: Arc<std::sync::Mutex<HashMap<String, DispatchSlot>>>,
     prompt_dispatch_gen: Arc<std::sync::atomic::AtomicU64>,
     /// Per-agent install gate. claude-agent-acp lazy-installs its
     /// native binary on first ever run; two concurrent `session/new`
@@ -2754,34 +2775,42 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
-    /// Cancel the current turn for a running structured view worker. Best-effort:
-    /// returns Ok if the worker exists even when no turn is in flight.
-    ///
-    /// A worker whose connection task has already ended counts as
-    /// cancelled rather than failed. That is the window a force stop
-    /// opens: the task exits, its command receiver drops, and the (now
-    /// dead) `WorkerHandle` stays in the map until the respawn swaps it,
-    /// so a cancel arriving in between fails to send instantly. There is
-    /// nothing left to cancel by then, and the resumed worker starts
-    /// idle, so answering the user's stop with an error was reporting a
-    /// fault for an outcome they got. See #3401.
     /// Reserve the window between accepting a prompt and handing it to the
-    /// agent, so a `session/cancel` arriving inside it latches onto this
-    /// dispatch rather than being swallowed. See `prompt_dispatches`.
+    /// agent, so a `session/cancel` arriving inside it is re-sent once the
+    /// prompt is away. See `prompt_dispatches` and `DispatchSlot`.
+    ///
+    /// Re-entrant: nesting shares the session's slot and bumps its refcount,
+    /// so the composer handler's outer reservation and `send_turn`'s inner one
+    /// cooperate instead of evicting each other.
     ///
     /// Dropping the returned guard without calling `take_pending_cancel`
-    /// clears the reservation, which is the correct answer for a handler that
-    /// bailed before dispatching: no turn ever started, so there is nothing to
-    /// cancel.
+    /// releases this level and, if it was the last, discards any latch. That is
+    /// safe only because `acp_cancel` forwards every cancel as it arrives.
     pub fn begin_prompt_dispatch(&self, session_id: &str) -> PromptDispatchGuard {
-        let generation = self
-            .prompt_dispatch_gen
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            .wrapping_add(1);
-        self.prompt_dispatches
-            .lock()
-            .expect("prompt dispatch mutex")
-            .insert(session_id.to_string(), (generation, false));
+        let generation = {
+            let mut slots = lock_recover(&self.prompt_dispatches);
+            match slots.get_mut(session_id) {
+                Some(slot) => {
+                    slot.refs += 1;
+                    slot.generation
+                }
+                None => {
+                    let generation = self
+                        .prompt_dispatch_gen
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        .wrapping_add(1);
+                    slots.insert(
+                        session_id.to_string(),
+                        DispatchSlot {
+                            generation,
+                            refs: 1,
+                            cancel_requested: false,
+                        },
+                    );
+                    generation
+                }
+            }
+        };
         PromptDispatchGuard {
             slots: Arc::clone(&self.prompt_dispatches),
             session_id: session_id.to_string(),
@@ -2799,19 +2828,27 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// dispatching, and the queued path does exactly that while a turn is
     /// already running.
     pub fn cancel_during_prompt_dispatch(&self, session_id: &str) -> bool {
-        let mut slots = self
-            .prompt_dispatches
-            .lock()
-            .expect("prompt dispatch mutex");
+        let mut slots = lock_recover(&self.prompt_dispatches);
         match slots.get_mut(session_id) {
             Some(slot) => {
-                slot.1 = true;
+                slot.cancel_requested = true;
                 true
             }
             None => false,
         }
     }
 
+    /// Cancel the current turn for a running structured view worker. Best-effort:
+    /// returns Ok if the worker exists even when no turn is in flight.
+    ///
+    /// A worker whose connection task has already ended counts as
+    /// cancelled rather than failed. That is the window a force stop
+    /// opens: the task exits, its command receiver drops, and the (now
+    /// dead) `WorkerHandle` stays in the map until the respawn swaps it,
+    /// so a cancel arriving in between fails to send instantly. There is
+    /// nothing left to cancel by then, and the resumed worker starts
+    /// idle, so answering the user's stop with an error was reporting a
+    /// fault for an outcome they got. See #3401.
     pub async fn cancel_prompt(&self, session_id: &str) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
         match client.cancel_prompt().await {
@@ -5283,6 +5320,34 @@ cursor-acp-bridge = "agent acp"
             "a latch dropped on a non-dispatch exit is gone, so the forward at \
              cancel time is what stops the running turn"
         );
+
+        // Re-entrancy: the composer handler's outer reservation and
+        // `send_turn`'s inner one share a slot. A cancel latched at either
+        // level must survive until the OUTERMOST holder releases, otherwise the
+        // inner release would answer the latch and the outer one would forward
+        // a second, spurious cancel.
+        let outer = sup.begin_prompt_dispatch("s6");
+        let inner = sup.begin_prompt_dispatch("s6");
+        assert!(sup.cancel_during_prompt_dispatch("s6"));
+        assert!(
+            !inner.take_pending_cancel(),
+            "an inner release must not claim the latch"
+        );
+        assert!(
+            sup.cancel_during_prompt_dispatch("s6"),
+            "the slot is still open for the outer holder"
+        );
+        assert!(
+            outer.take_pending_cancel(),
+            "the outermost holder answers it"
+        );
+
+        // A non-composer producer (plugin turn, pending initial turn, queue
+        // drain) reaches `send_turn` with no outer holder, so its reservation
+        // is the outermost and it owes the re-send itself.
+        let only = sup.begin_prompt_dispatch("s7");
+        assert!(sup.cancel_during_prompt_dispatch("s7"));
+        assert!(only.take_pending_cancel());
 
         // A stale guard must not clear the reservation a later prompt made.
         let first = sup.begin_prompt_dispatch("s4");

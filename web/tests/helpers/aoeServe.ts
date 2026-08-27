@@ -208,7 +208,13 @@ export async function waitForQueuedPrompts(
         const res = await fetch(`${baseUrl}/api/sessions/${encodeURIComponent(sessionId)}/queue`);
         if (!res.ok) throw new Error(`GET /queue failed: ${res.status}`);
         const body = await res.json();
-        return Array.isArray(body) ? body.length : (body?.queued_prompts?.length ?? 0);
+        // `queue_list` returns a bare array. Throw rather than coercing an
+        // unexpected shape to 0, which `expect.poll` would turn into a 15s
+        // timeout blaming the daemon for a response-shape change.
+        if (!Array.isArray(body)) {
+          throw new Error(`GET /queue returned an unexpected shape: ${JSON.stringify(body).slice(0, 200)}`);
+        }
+        return body.length;
       },
       {
         timeout,

@@ -1433,25 +1433,12 @@ pub async fn acp_prompt(
     // `session::smart_rename` and #2348.
     match outcome {
         Ok(()) => {
-            // The prompt is away. If Stop was pressed while it was still in
-            // dispatch, that cancel already went out ahead of the prompt, where
-            // the agent drops it on turn start; re-send it now so the agent sees
-            // prompt-then-cancel and ends the turn the user was looking at.
-            if dispatch_guard.take_pending_cancel() {
-                tracing::info!(
-                    target: "http.api.acp",
-                    session = %id,
-                    "applying a cancel that arrived while the prompt was in dispatch"
-                );
-                if let Err(e) = state.acp_supervisor.cancel_prompt(&id).await {
-                    tracing::warn!(
-                        target: "http.api.acp",
-                        session = %id,
-                        error = %e,
-                        "deferred cancel after prompt dispatch failed"
-                    );
-                }
-            }
+            // `send_turn` holds an inner reservation and answers the latch when
+            // it is the outermost holder, so for this path the call below is
+            // normally a no-op. It stays because the reservation taken at the
+            // top of this handler covers the pre-dispatch work `send_turn`
+            // never sees, and that outer level is the one released here.
+            forward_deferred_cancel(&state, &id, dispatch_guard).await;
             (
                 StatusCode::ACCEPTED,
                 Json(PromptDispatchResponse {
@@ -1544,6 +1531,11 @@ pub async fn acp_prompt_diff_comments(
             }
         }
     }
+    // Same reordering guard as the composer path: the publish below marks the
+    // turn active, so a Stop can be pressed and its cancel forwarded before
+    // `send_prompt` reaches the agent. Reserved across publish-and-forward so
+    // such a cancel is re-sent once the prompt is away.
+    let dispatch_guard = state.acp_supervisor.begin_prompt_dispatch(&id);
     // Publish the typed event BEFORE forwarding so the replay buffer /
     // on-disk store captures the user's side even if the forward fails,
     // matching acp_prompt.
@@ -1563,12 +1555,44 @@ pub async fn acp_prompt_diff_comments(
         .send_prompt(&id, &req.assembled_markdown, &[])
         .await
     {
-        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Ok(()) => {
+            forward_deferred_cancel(&state, &id, dispatch_guard).await;
+            StatusCode::ACCEPTED.into_response()
+        }
         // Retryable worker_not_ready override; mirrors acp_prompt. See #1748.
         Err(SupervisorError::UnknownSession(_)) if woke_idle_dormant => {
             (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
         }
         Err(e) => supervisor_error_response("prompt failed", &e),
+    }
+}
+
+/// Re-send a cancel that arrived while `guard`'s prompt was still in dispatch.
+///
+/// The agent drops a `session/cancel` that lands before the prompt it was aimed
+/// at (it clears its cancel flag on turn start), so the ordering is only fixed
+/// by sending it again once the prompt is away. No-op unless this guard is the
+/// outermost holder and a cancel was actually latched.
+async fn forward_deferred_cancel(
+    state: &Arc<AppState>,
+    id: &str,
+    guard: crate::acp::supervisor::PromptDispatchGuard,
+) {
+    if !guard.take_pending_cancel() {
+        return;
+    }
+    tracing::info!(
+        target: "http.api.acp",
+        session = %id,
+        "re-sending a cancel that arrived while the prompt was in dispatch"
+    );
+    if let Err(e) = state.acp_supervisor.cancel_prompt(id).await {
+        tracing::warn!(
+            target: "http.api.acp",
+            session = %id,
+            error = %e,
+            "re-sent cancel after prompt dispatch failed"
+        );
     }
 }
 
@@ -3357,6 +3381,96 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(state.instance_locks.read().await.is_empty());
+    }
+
+    /// The reservation has to be visible to `acp_cancel` for the whole
+    /// pre-dispatch window, and a cancel arriving inside it must still be
+    /// forwarded straight away.
+    ///
+    /// Forwarding is the part worth pinning at the handler level. Deferring
+    /// instead loses the cancel on every exit that never dispatches, and the
+    /// queued path is exactly that exit while a turn is already running, which
+    /// is how the regression on this PR's first head got in. The supervisor
+    /// test one layer down cannot see it: it never calls either handler.
+    #[tokio::test]
+    async fn cancel_during_the_prompt_window_is_latched_and_still_forwarded() {
+        use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
+        use std::time::Duration;
+
+        let mut inst = crate::session::Instance::new("cancel-race", "/tmp/aoe-cancel-race");
+        inst.id = "sess-cancel-race".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        // Park the prompt handler mid-flight, the same way #3172's test does,
+        // so the reservation is provably open while the cancel lands.
+        let reservation = match state
+            .acp_supervisor
+            .begin_resume(&id, ResumeKind::Spawn)
+            .await
+            .expect("begin_resume must not error under capacity")
+        {
+            ResumeReservationOutcome::Reserved(r) => r,
+            ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
+        };
+
+        let handler = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                acp_prompt(
+                    State(state),
+                    Path(id),
+                    Ok(Json(PromptRequest {
+                        text: "kick off".to_string(),
+                        attachments: Vec::new(),
+                        prompt_id: None,
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Mid-window: the reservation is open, so a cancel latches onto it.
+        assert!(
+            state.acp_supervisor.cancel_during_prompt_dispatch(&id),
+            "the prompt handler must hold a reservation while it works"
+        );
+
+        // And it does not stop at the latch: it goes on to forward, which is
+        // the property that keeps a non-dispatching exit from losing the Stop.
+        //
+        // Absence of a worker is what makes that observable. `cancel_prompt`
+        // waits on `ready_client` -> `wait_for_worker(WORKER_READY_TIMEOUT)`,
+        // so with no worker the forward parks for ~10s and only then errors,
+        // exactly as it does on main. The deferring version this replaced
+        // returned 202 immediately once it saw the latch, so "still running
+        // after a second" distinguishes the two without needing an agent.
+        let cancel = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move { acp_cancel(State(state), Path(id)).await.into_response() }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !cancel.is_finished(),
+            "acp_cancel returned without attempting the forward, so a latched \
+             cancel would be the only record of the user's Stop"
+        );
+
+        drop(reservation);
+        let _ = tokio::time::timeout(Duration::from_secs(15), handler).await;
+        let _ = tokio::time::timeout(Duration::from_secs(15), cancel).await;
+
+        // The handler released its reservation on the way out, so a later
+        // cancel has nothing to latch onto.
+        assert!(
+            !state.acp_supervisor.cancel_during_prompt_dispatch(&id),
+            "the reservation must not outlive the handler"
+        );
     }
 
     /// #3172: two invariants of the idle-dormant prompt-wake path, both of
